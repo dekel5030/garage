@@ -40,6 +40,22 @@ use crate::encryption::{EncryptionParams, OekDerivationInfo};
 use crate::error::*;
 use crate::website::X_AMZ_WEBSITE_REDIRECT_LOCATION;
 
+const X_AMZ_META_PREFIX: &str = "x-amz-meta-";
+
+/// Extracts user-defined metadata from S3 request headers (x-amz-meta-*).
+fn extract_user_metadata(headers: &[(String, String)]) -> HashMap<String, String> {
+	let mut metadata = HashMap::new();
+	for (name, value) in headers {
+		if name.len() >= X_AMZ_META_PREFIX.len()
+			&& name.as_str()[..X_AMZ_META_PREFIX.len()].eq_ignore_ascii_case(X_AMZ_META_PREFIX)
+		{
+			let key = name[X_AMZ_META_PREFIX.len()..].to_string();
+			metadata.insert(key, value.clone());
+		}
+	}
+	metadata
+}
+
 pub(crate) struct SaveStreamResult {
 	pub(crate) version_uuid: Uuid,
 	pub(crate) version_timestamp: u64,
@@ -207,7 +223,9 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 			.headers
 			.iter()
 			.find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-			.map(|(_, v)| v.clone());
+			.map(|(_, v)| v.clone())
+			.unwrap_or_else(|| "application/octet-stream".to_string());
+		let metadata = extract_user_metadata(&meta.headers);
 		let inline_data = encryption.encrypt_blob(&first_block)?.to_vec();
 
 		let object_version = ObjectVersion {
@@ -227,19 +245,33 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 		garage.object_table.insert(&object).await?;
 
 		if let (Some(events), Some(rabbit_cfg)) = (&object_events, &garage.config.rabbitmq) {
-			if rabbit_cfg.publish_object_created && rabbit_cfg.should_publish_object_created(key) {
-				let event = ObjectCreatedEvent {
-					event_type: "object_created".to_string(),
-					event_id: gen_uuid(),
-					occurred_at: chrono::Utc::now(),
-					bucket_id: *bucket_id,
-					key: key.clone(),
-					version_id: version_uuid,
-					size,
-					content_type,
-				};
+			if rabbit_cfg.publish_object_created {
+				if let Some(reason) = rabbit_cfg.skip_reason_object_created(key) {
+					info!(
+						bucket = %bucket_name,
+						key = %key,
+						reason = %reason,
+						"RabbitMQ: skipping object_created event (filter)"
+					);
+				} else {
+					let event = ObjectCreatedEvent {
+						key: key.clone(),
+						bucket: bucket_name.to_string(),
+						size,
+						content_type: content_type.clone(),
+						occurred_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+						metadata: metadata.clone(),
+					};
 
-				publish_object_created(events.clone(), rabbit_cfg.clone(), bucket_name, &event);
+					info!(
+						key = %key,
+						metadata_count = metadata.len(),
+						"Publishing event for key: [{}] with {} metadata tags",
+						key,
+						metadata.len()
+					);
+					publish_object_created(events.clone(), rabbit_cfg.clone(), bucket_name, &event);
+				}
 			}
 		}
 
@@ -331,7 +363,9 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 		.headers
 		.iter()
 		.find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-		.map(|(_, v)| v.clone());
+		.map(|(_, v)| v.clone())
+		.unwrap_or_else(|| "application/octet-stream".to_string());
+	let metadata = extract_user_metadata(&meta.headers);
 
 	object_version.state = ObjectVersionState::Complete(ObjectVersionData::FirstBlock(
 		ObjectVersionMeta {
@@ -345,19 +379,33 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 	garage.object_table.insert(&object).await?;
 
 	if let (Some(events), Some(rabbit_cfg)) = (&object_events, &garage.config.rabbitmq) {
-		if rabbit_cfg.publish_object_created && rabbit_cfg.should_publish_object_created(key) {
-			let event = ObjectCreatedEvent {
-				event_type: "object_created".to_string(),
-				event_id: gen_uuid(),
-				occurred_at: chrono::Utc::now(),
-				bucket_id: *bucket_id,
-				key: key.clone(),
-				version_id: version_uuid,
-				size: total_size,
-				content_type,
-			};
+		if rabbit_cfg.publish_object_created {
+			if let Some(reason) = rabbit_cfg.skip_reason_object_created(key) {
+				info!(
+					bucket = %bucket_name,
+					key = %key,
+					reason = %reason,
+					"RabbitMQ: skipping object_created event (filter)"
+				);
+			} else {
+				let event = ObjectCreatedEvent {
+					key: key.clone(),
+					bucket: bucket_name.to_string(),
+					size: total_size,
+					content_type: content_type.clone(),
+					occurred_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+					metadata: metadata.clone(),
+				};
 
-			publish_object_created(events.clone(), rabbit_cfg.clone(), bucket_name, &event);
+				info!(
+					key = %key,
+					metadata_count = metadata.len(),
+					"Publishing event for key: [{}] with {} metadata tags",
+					key,
+					metadata.len()
+				);
+				publish_object_created(events.clone(), rabbit_cfg.clone(), bucket_name, &event);
+			}
 		}
 	}
 
@@ -394,16 +442,26 @@ fn publish_object_created(
 	let payload = match serde_json::to_vec(event) {
 		Ok(p) => p,
 		Err(e) => {
-			warn!("Failed to serialize ObjectCreatedEvent for RabbitMQ: {}", e);
+			error!(
+				key = %event.key,
+				error = %e,
+				"RabbitMQ: failed to serialize ObjectCreatedEvent"
+			);
 			return;
 		}
 	};
 
+	debug!(
+		payload = %String::from_utf8_lossy(&payload),
+		"RabbitMQ: object_created payload"
+	);
+
 	tokio::spawn(async move {
 		if let Err(e) = client.publish(&routing_key, &payload).await {
-			warn!(
-				"Failed to publish ObjectCreatedEvent to RabbitMQ (routing_key={}): {}",
-				routing_key, e
+			error!(
+				routing_key = %routing_key,
+				error = %e,
+				"RabbitMQ: failed to publish object_created event"
 			);
 		}
 	});

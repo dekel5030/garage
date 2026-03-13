@@ -40,9 +40,18 @@ pub async fn run_server(
 	let object_events = if let Some(rabbit_cfg) = &config.rabbitmq {
 		if rabbit_cfg.publish_object_created {
 			match RabbitClient::new(rabbit_cfg.clone()).await {
-				Ok(client) => Some(Arc::new(client)),
+				Ok(client) => {
+					info!(
+						exchange = %rabbit_cfg.exchange,
+						"RabbitMQ client connected; integration events (object_created) enabled"
+					);
+					Some(Arc::new(client))
+				}
 				Err(e) => {
-					error!("Failed to initialize RabbitMQ client, integration events will be disabled: {}", e);
+					error!(
+						error = %e,
+						"Failed to initialize RabbitMQ client, integration events will be disabled"
+					);
 					None
 				}
 			}

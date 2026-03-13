@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions};
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
@@ -67,6 +66,7 @@ impl RabbitClient {
 		const BACKOFF_MS: u64 = 500;
 
 		let mut attempt = 0;
+		let mut last_error_message: Option<String> = None;
 		loop {
 			attempt += 1;
 
@@ -91,15 +91,24 @@ impl RabbitClient {
 						.await
 						.map_err(|e| Error::Message(format!("RabbitMQ confirm await error: {e}")))?;
 					if outcome.is_ack() {
+						info!(
+							exchange = %self.config.exchange,
+							routing_key = %routing_key,
+							"RabbitMQ: object_created event published"
+						);
 						return Ok(());
 					}
 
+					last_error_message = Some(format!("RabbitMQ publish not acknowledged: {:?}", outcome));
 					warn!(
-						"RabbitMQ publish not acknowledged (routing_key={}): {:?}",
-						routing_key, outcome
+						exchange = %self.config.exchange,
+						routing_key = %routing_key,
+						"RabbitMQ publish not acknowledged: {:?}",
+						outcome
 					);
 				}
 				Err(e) => {
+					last_error_message = Some(e.to_string());
 					warn!(
 						"RabbitMQ publish attempt {} failed for routing_key={}: {}",
 						attempt, routing_key, e
@@ -108,10 +117,19 @@ impl RabbitClient {
 			}
 
 			if attempt >= MAX_ATTEMPTS {
-				return Err(Error::Message(format!(
-					"RabbitMQ publish failed after {} attempts (routing_key={})",
-					MAX_ATTEMPTS, routing_key
-				)));
+				let msg = last_error_message.unwrap_or_else(|| {
+					format!(
+						"RabbitMQ publish failed after {} attempts (routing_key={})",
+						MAX_ATTEMPTS, routing_key
+					)
+				});
+				error!(
+					exchange = %self.config.exchange,
+					routing_key = %routing_key,
+					error = %msg,
+					"RabbitMQ: failed to publish object_created event after retries"
+				);
+				return Err(Error::Message(msg));
 			}
 
 			tokio::time::sleep(Duration::from_millis(BACKOFF_MS * attempt as u64)).await;

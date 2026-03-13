@@ -257,27 +257,32 @@ pub struct RabbitConfig {
 }
 
 impl RabbitConfig {
-	/// Decide whether an ObjectCreated event should be published for the given key.
-	pub fn should_publish_object_created(&self, key: &str) -> bool {
+	/// Returns the reason an ObjectCreated event should be skipped for this key, or `None` if it should be published.
+	pub fn skip_reason_object_created(&self, key: &str) -> Option<&'static str> {
 		if let Some(prefixes) = &self.filter_prefixes {
 			if !prefixes.is_empty() && !prefixes.iter().any(|p| key.starts_with(p)) {
-				return false;
+				return Some("key does not match filter_prefixes");
 			}
 		}
 
 		if let Some(ignored) = &self.ignored_extensions {
 			if !ignored.is_empty() && ignored.iter().any(|ext| key.ends_with(ext)) {
-				return false;
+				return Some("key matches ignored_extensions");
 			}
 		}
 
 		if let Some(allowed) = &self.allowed_extensions {
 			if !allowed.is_empty() && !allowed.iter().any(|ext| key.ends_with(ext)) {
-				return false;
+				return Some("key does not match allowed_extensions");
 			}
 		}
 
-		true
+		None
+	}
+
+	/// Decide whether an ObjectCreated event should be published for the given key.
+	pub fn should_publish_object_created(&self, key: &str) -> bool {
+		self.skip_reason_object_created(key).is_none()
 	}
 }
 
